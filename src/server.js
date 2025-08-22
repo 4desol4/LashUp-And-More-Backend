@@ -15,7 +15,7 @@ const prisma = new PrismaClient();
 
 const allowed = [
   "http://localhost:3000", 
-  "https://LashUp-And-More-Frontend.vercel.app"
+  "https://lash-up-and-more-frontend.vercel.app/"
 ];
 
 const corsOptions = {
