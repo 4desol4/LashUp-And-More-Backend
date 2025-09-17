@@ -101,7 +101,7 @@ export const initializePayment = async (req, res) => {
     }
 
     // Add shipping fee (you can make this dynamic based on location)
-    const shippingFee = 2000; // ₦20 shipping fee
+    const shippingFee = 10; // ₦20 shipping fee
     totalAmount += shippingFee;
 
     // Initialize Paystack payment
