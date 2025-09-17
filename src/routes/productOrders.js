@@ -1,19 +1,21 @@
 import express from "express";
 import {
-  createOrder,
   getUserOrders,
   getAllOrders,
   updateOrderStatus,
-  cancelOrder  
+  initializePayment,
+  verifyPayment,
 } from "../controllers/productOrderController.js";
 import { protect, adminOnly } from "../middleware/auth.js";
 
 const router = express.Router();
 
+// Payment routes
+router.post("/payment/initialize", protect, initializePayment);
+router.get("/payment/verify/:reference", verifyPayment);
+
 // Users
-router.post("/", protect, createOrder);
 router.get("/me", protect, getUserOrders);
-router.put("/:id/cancel", protect, cancelOrder);
 
 // Admin
 router.get("/", protect, adminOnly, getAllOrders);

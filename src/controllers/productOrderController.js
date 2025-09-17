@@ -1,6 +1,7 @@
 import prisma from "../utils/prisma.js";
 import nodemailer from "nodemailer";
-import { ProductOrderStatus } from "@prisma/client";
+import { ProductOrderStatus, PaymentStatus } from "@prisma/client";
+import axios from "axios";
 
 const createTransporter = async () => {
   if (
@@ -39,120 +40,261 @@ const createTransporter = async () => {
   throw new Error("All SMTP connection attempts failed");
 };
 
-// CREATE ORDER
-export const createOrder = async (req, res) => {
+// INITIALIZE PAYMENT
+export const initializePayment = async (req, res) => {
   try {
-    let { productId, quantity } = req.body;
+    const { items, shippingInfo } = req.body;
     const userId = req.user.userId;
 
-    if (!productId || !quantity)
+    if (!items || !Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ message: "Items are required" });
+    }
+
+    if (!shippingInfo) {
       return res
         .status(400)
-        .json({ message: "Product ID and quantity are required" });
+        .json({ message: "Shipping information is required" });
+    }
 
-    productId = productId.trim();
-
-    const product = await prisma.product.findUnique({
-      where: { id: productId },
-    });
-    if (!product) return res.status(404).json({ message: "Product not found" });
-
-    const order = await prisma.productOrder.create({
-      data: {
-        quantity,
-        user: { connect: { id: userId } },
-        product: { connect: { id: productId } },
-        status: "PENDING",
-      },
-      include: { product: true, user: true },
-    });
-
-    res.status(201).json({ message: "Order created", order });
-
-    (async () => {
-      try {
-        const transporter = await createTransporter();
-
-        await transporter.sendMail({
-          from: `"LashUp And Mores" <${process.env.EMAIL_USER}>`,
-          to: process.env.ADMIN_EMAIL,
-          subject: "New Product Order Received",
-          html: `<p><b>${order.user.name}</b> (${order.user.email}) ordered <b>${quantity}</b> × <b>${order.product.name}</b>.</p>`,
-        });
-
-        await transporter.sendMail({
-          from: `"LashUp And More" <${process.env.EMAIL_USER}>`,
-          to: order.user.email,
-          subject: "Order Confirmation",
-          html: `<h3>Thank you for your order, ${order.user.name}!</h3>
-                 <p>You have successfully ordered <b>${quantity}</b> × <b>${order.product.name}</b>.</p>
-                 <p>We'll notify you once your order is processed and shipped.</p>
-                 <br/><p>— The LashUp And More Team</p>`,
-        });
-      } catch (emailErr) {
-        console.error("Email sending failed (order):", emailErr.message);
+    // Validate shipping info
+    const requiredFields = [
+      "firstName",
+      "lastName",
+      "email",
+      "phone",
+      "address",
+      "city",
+      "state",
+    ];
+    for (const field of requiredFields) {
+      if (!shippingInfo[field]) {
+        return res
+          .status(400)
+          .json({ message: `${field} is required in shipping information` });
       }
-    })();
+    }
+
+    // Calculate total amount
+    let totalAmount = 0;
+    const orderItems = [];
+
+    for (const item of items) {
+      const product = await prisma.product.findUnique({
+        where: { id: item.productId },
+      });
+
+      if (!product) {
+        return res
+          .status(404)
+          .json({ message: `Product ${item.productId} not found` });
+      }
+
+      const itemTotal = product.price * item.quantity;
+      totalAmount += itemTotal;
+
+      orderItems.push({
+        productId: item.productId,
+        quantity: item.quantity,
+        price: product.price,
+        product: product,
+      });
+    }
+
+    // Add shipping fee (you can make this dynamic based on location)
+    const shippingFee = 2000; // ₦20 shipping fee
+    totalAmount += shippingFee;
+
+    // Initialize Paystack payment
+    const paystackData = {
+      email: shippingInfo.email,
+      amount: Math.round(totalAmount * 100), // Paystack expects amount in kobo
+      reference: `order_${Date.now()}_${userId}`,
+      callback_url: `${process.env.FRONTEND_URL}/payment/success`,
+      metadata: {
+        userId,
+        orderItems: JSON.stringify(
+          orderItems.map((item) => ({
+            productId: item.productId,
+            quantity: item.quantity,
+            price: item.price,
+          }))
+        ),
+        shippingInfo: JSON.stringify(shippingInfo),
+        shippingFee,
+      },
+    };
+
+    const paystackResponse = await axios.post(
+      "https://api.paystack.co/transaction/initialize",
+      paystackData,
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
+          "Content-Type": "application/json",
+        },
+      }
+    );
+
+    if (paystackResponse.data.status) {
+      // Create pending orders in database (PENDING status until payment is verified)
+      const orders = [];
+      for (const item of orderItems) {
+        const order = await prisma.productOrder.create({
+          data: {
+            userId,
+            productId: item.productId,
+            quantity: item.quantity,
+            totalAmount: item.price * item.quantity,
+            paymentReference: paystackData.reference,
+            paymentStatus: "PENDING",
+            status: "PENDING", // Will be changed to CONFIRMED after payment verification
+            shippingInfo: shippingInfo,
+          },
+          include: { product: true, user: true },
+        });
+        orders.push(order);
+      }
+
+      res.status(200).json({
+        message: "Payment initialized",
+        payment_url: paystackResponse.data.data.authorization_url,
+        reference: paystackData.reference,
+        orders,
+      });
+    } else {
+      throw new Error("Failed to initialize payment");
+    }
   } catch (err) {
-    console.error("Order creation error:", err);
-    res.status(500).json({ message: "Server error" });
+    console.error("Payment initialization error:", err);
+    const message =
+      err.response?.data?.message || "Failed to initialize payment";
+    res.status(500).json({ message });
   }
 };
 
-// CANCEL ORDER (USER)
-export const cancelOrder = async (req, res) => {
+// VERIFY PAYMENT
+export const verifyPayment = async (req, res) => {
   try {
-    const userId = req.user.userId;
-    const { id } = req.params;
+    const { reference } = req.params;
 
-    const order = await prisma.productOrder.findUnique({
-      where: { id },
-    });
+    if (!reference) {
+      return res.status(400).json({ message: "Payment reference is required" });
+    }
 
-    if (!order) return res.status(404).json({ message: "Order not found" });
-    if (order.userId !== userId)
-      return res.status(403).json({ message: "Unauthorized" });
-    if (["SHIPPED", "DELIVERED", "CANCELLED"].includes(order.status))
-      return res
-        .status(400)
-        .json({ message: "This order cannot be cancelled" });
-
-    
-    const cancelledOrder = await prisma.productOrder.update({
-      where: { id },
-      data: {
-        status: "CANCELLED",
-        cancelledBy: "USER", 
-      },
-      include: { product: true, user: true },
-    });
-
-
-    (async () => {
-      try {
-        const transporter = await createTransporter();
-        await transporter.sendMail({
-          from: `"LashUp And More" <${process.env.EMAIL_USER}>`,
-          to: cancelledOrder.user.email,
-          subject: "Order Cancelled",
-          html: `<p>Hi ${cancelledOrder.user.name},</p>
-                 <p>Your order for <b>${cancelledOrder.quantity} × ${cancelledOrder.product.name}</b> has been cancelled successfully.</p>`,
-        });
-      } catch (emailErr) {
-        console.error("Email sending failed (cancel order):", emailErr.message);
+    // Verify payment with Paystack
+    const paystackResponse = await axios.get(
+      `https://api.paystack.co/transaction/verify/${reference}`,
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
+        },
       }
-    })();
+    );
 
-    res
-      .status(200)
-      .json({ message: "Order cancelled successfully", order: cancelledOrder });
+    const paymentData = paystackResponse.data.data;
+
+    if (paymentData.status === "success") {
+      // Update orders in database - Change to CONFIRMED after successful payment
+      await prisma.productOrder.updateMany({
+        where: { paymentReference: reference },
+        data: {
+          paymentStatus: "SUCCESSFUL",
+          status: "CONFIRMED", // This is where it becomes confirmed - payment verified
+        },
+      });
+
+      // Get updated orders with relations
+      const updatedOrders = await prisma.productOrder.findMany({
+        where: { paymentReference: reference },
+        include: { product: true, user: true },
+      });
+
+      res.status(200).json({
+        message: "Payment verified successfully",
+        orders: updatedOrders,
+        paymentData,
+      });
+
+      // Send confirmation emails
+      (async () => {
+        try {
+          const transporter = await createTransporter();
+          const user = updatedOrders[0]?.user;
+
+          if (user) {
+            const orderList = updatedOrders
+              .map(
+                (order) =>
+                  `${order.quantity}x ${order.product.name} - ₦${(
+                    order.product.price * order.quantity
+                  ).toLocaleString()}`
+              )
+              .join("<br>");
+
+            await transporter.sendMail({
+              from: `"LashUpAndMore" <${process.env.EMAIL_USER}>`,
+              to: user.email,
+              subject: "Order Confirmed - Payment Successful",
+              html: `
+                <h3>Thank you for your order, ${user.name}!</h3>
+                <p>Your payment has been confirmed and your order is being processed.</p>
+                <p><strong>Order Reference:</strong> ${reference}</p>
+                <p><strong>Items Ordered:</strong></p>
+                <p>${orderList}</p>
+                <p><strong>Total Amount:</strong> ₦${(
+                  paymentData.amount / 100
+                ).toLocaleString()}</p>
+                <p>We'll notify you when your order is shipped.</p>
+              `,
+            });
+
+            await transporter.sendMail({
+              from: `"LashUpAndMore" <${process.env.EMAIL_USER}>`,
+              to: process.env.ADMIN_EMAIL,
+              subject: "New Order - Payment Confirmed",
+              html: `
+                <h3>New Order Received</h3>
+                <p><strong>Customer:</strong> ${user.name} (${user.email})</p>
+                <p><strong>Reference:</strong> ${reference}</p>
+                <p><strong>Items:</strong></p>
+                <p>${orderList}</p>
+                <p><strong>Total Amount:</strong> ₦${(
+                  paymentData.amount / 100
+                ).toLocaleString()}</p>
+                <p><strong>Status:</strong> CONFIRMED - Ready to process</p>
+              `,
+            });
+          }
+        } catch (emailErr) {
+          console.error(
+            "Email sending failed (order confirmation):",
+            emailErr.message
+          );
+        }
+      })();
+    } else {
+      // Payment failed - mark orders as cancelled
+      await prisma.productOrder.updateMany({
+        where: { paymentReference: reference },
+        data: {
+          paymentStatus: "FAILED",
+          status: "CANCELLED",
+        },
+      });
+
+      res.status(400).json({
+        message: "Payment verification failed",
+        paymentData,
+      });
+    }
   } catch (err) {
-    console.error("Cancel order error:", err);
-    res.status(500).json({ message: "Server error" });
+    console.error("Payment verification error:", err);
+    const message = err.response?.data?.message || "Failed to verify payment";
+    res.status(500).json({ message });
   }
 };
 
-// UPDATE ORDER STATUS (ADMIN)
+// UPDATE ORDER STATUS (ADMIN) - Only for CONFIRMED orders (paid orders)
 export const updateOrderStatus = async (req, res) => {
   try {
     const { id } = req.params;
@@ -160,10 +302,17 @@ export const updateOrderStatus = async (req, res) => {
 
     if (!status) return res.status(400).json({ message: "Status is required" });
     status = status.trim().toUpperCase();
-    if (!Object.values(ProductOrderStatus).includes(status))
-      return res.status(400).json({ message: "Invalid order status" });
 
-   
+    // Only allow these statuses for admin to change (after payment is confirmed)
+    const allowedStatuses = ["CONFIRMED", "SHIPPED", "DELIVERED"];
+
+    if (!allowedStatuses.includes(status)) {
+      return res.status(400).json({
+        message:
+          "Invalid status. Admin can only set CONFIRMED, SHIPPED, or DELIVERED",
+      });
+    }
+
     const existingOrder = await prisma.productOrder.findUnique({
       where: { id },
     });
@@ -172,43 +321,67 @@ export const updateOrderStatus = async (req, res) => {
       return res.status(404).json({ message: "Order not found" });
     }
 
-   
-    if (existingOrder.cancelledBy === "USER") {
+    // Prevent updating orders that haven't been paid for
+    if (existingOrder.paymentStatus !== "SUCCESSFUL") {
       return res.status(400).json({
-        message: "Cannot modify orders that were cancelled by the user",
+        message: "Cannot update status of unpaid orders",
       });
     }
 
-    const updateData = { status };
-
-    if (status === "CANCELLED") {
-      updateData.cancelledBy = "ADMIN";
-    }
-   
-    else if (
-      existingOrder.status === "CANCELLED" &&
-      existingOrder.cancelledBy === "ADMIN"
-    ) {
-      updateData.cancelledBy = null;
+    // Prevent updating cancelled orders
+    if (existingOrder.status === "CANCELLED") {
+      return res.status(400).json({
+        message: "Cannot update cancelled orders",
+      });
     }
 
     const order = await prisma.productOrder.update({
       where: { id },
-      data: updateData,
+      data: { status },
       include: { user: true, product: true },
     });
 
     res.status(200).json({ message: "Order status updated", order });
 
+    // Send notification email based on status
     (async () => {
       try {
         const transporter = await createTransporter();
+        let emailSubject = "Order Status Updated";
+        let emailContent = "";
+
+        switch (status) {
+          case "CONFIRMED":
+            emailSubject = "Order Confirmed - Being Prepared";
+            emailContent = `
+              <p>Hi ${order.user.name},</p>
+              <p>Your order for <b>${order.quantity} × ${order.product.name}</b> has been confirmed and is being prepared.</p>
+              <p>We'll notify you once it's shipped.</p>
+            `;
+            break;
+          case "SHIPPED":
+            emailSubject = "Order Shipped - On The Way";
+            emailContent = `
+              <p>Hi ${order.user.name},</p>
+              <p>Great news! Your order for <b>${order.quantity} × ${order.product.name}</b> has been shipped.</p>
+              <p>It's on its way to you and should arrive within 2-5 business days.</p>
+            `;
+            break;
+          case "DELIVERED":
+            emailSubject = "Order Delivered - Thank You!";
+            emailContent = `
+              <p>Hi ${order.user.name},</p>
+              <p>Your order for <b>${order.quantity} × ${order.product.name}</b> has been delivered.</p>
+              <p>Thank you for choosing LashUpAndMore! We hope you love your products.</p>
+            `;
+            break;
+        }
+
         await transporter.sendMail({
-          from: `"LashUp And More" <${process.env.EMAIL_USER}>`,
+          from: `"LashUpAndMore" <${process.env.EMAIL_USER}>`,
           to: order.user.email,
-          subject: "Order Status Updated",
-          html: `<p>Hi ${order.user.name},</p>
-                 <p>Your order for ${order.quantity} × <b>${order.product.name}</b> is now <b>${status}</b>.</p>`,
+          subject: emailSubject,
+          html: emailContent,
         });
       } catch (emailErr) {
         console.error("Email sending failed (order status):", emailErr.message);

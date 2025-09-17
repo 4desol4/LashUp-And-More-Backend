@@ -19,10 +19,24 @@ model User {
   updatedAt DateTime?      @updatedAt
 }
 
+model Service {
+  id          String    @id @default(auto()) @map("_id") @db.ObjectId
+  name        String
+  description String
+  price       Float
+  imageUrl    String
+  duration    Float
+  features    String[]
+  bookings    Booking[]
+  createdAt   DateTime  @default(now())
+}
+
 model Booking {
   id        String        @id @default(auto()) @map("_id") @db.ObjectId
-  service   String
+  service   Service       @relation(fields: [serviceId], references: [id])
+  serviceId String        @db.ObjectId
   date      DateTime
+  notes     String?
   user      User          @relation(fields: [userId], references: [id])
   userId    String        @db.ObjectId
   status    BookingStatus @default(PENDING)
@@ -49,7 +63,12 @@ model ProductOrder {
   quantity    Int                @default(1)
   status      ProductOrderStatus @default(PENDING)
   cancelledBy String?
-  createdAt   DateTime           @default(now())
+  paymentReference String?
+  paymentStatus    PaymentStatus @default(PENDING)
+  shippingInfo     Json? 
+  totalAmount      Float
+
+  createdAt DateTime @default(now())
 }
 
 model GalleryItem {
@@ -70,5 +89,12 @@ enum ProductOrderStatus {
   CONFIRMED
   SHIPPED
   DELIVERED
+  CANCELLED
+}
+
+enum PaymentStatus {
+  PENDING
+  SUCCESSFUL
+  FAILED
   CANCELLED
 }

@@ -6,21 +6,20 @@ import authRoutes from "./routes/auth.js";
 import bookingRoutes from "./routes/bookings.js";
 import productRoutes from "./routes/products.js";
 import galleryRoutes from "./routes/gallery.js";
-import productOrderRoutes from "./routes/productOrders.js"; 
-
+import productOrderRoutes from "./routes/productOrders.js";
+import serviceRoutes from "./routes/services.js";
 dotenv.config();
 
 const app = express();
 const prisma = new PrismaClient();
 
 const allowed = [
-  "http://localhost:3000", 
-  "https://lash-up-and-more-frontend.vercel.app/"
+  "http://localhost:3000",
+  "https://lash-up-and-more-frontend.vercel.app/",
 ];
 
 const corsOptions = {
   origin(origin, cb) {
-   
     if (!origin || origin.endsWith(".vercel.app") || allowed.includes(origin)) {
       return cb(null, true);
     }
@@ -37,7 +36,8 @@ app.use("/api/auth", authRoutes);
 app.use("/api/bookings", bookingRoutes);
 app.use("/api/products", productRoutes);
 app.use("/api/gallery", galleryRoutes);
-app.use("/api/orders", productOrderRoutes); 
+app.use("/api/orders", productOrderRoutes);
+app.use("/api/services", serviceRoutes);
 
 // Test route
 app.get("/", (req, res) => {
