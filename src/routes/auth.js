@@ -7,6 +7,9 @@ import {
   changePassword,
   deleteAccount,
   updateUserRole,
+  getAllUsers,
+  deleteUser,
+  getUserDetails
 } from "../controllers/authController.js";
 import { protect, adminOnly } from "../middleware/auth.js";
 
@@ -19,5 +22,11 @@ router.get("/profile", protect, getProfile);
 router.put("/profile", protect, updateProfile);
 router.put("/change-password", protect, changePassword);
 router.delete("/account", protect, deleteAccount);
+
+// Admin routes
+router.get("/admin/users", protect, adminOnly, getAllUsers);
 router.put("/admin/user/:userId/role", protect, adminOnly, updateUserRole);
+router.get("/users/:userId", protect, adminOnly, getUserDetails);
+router.delete("/users/:userId", protect, adminOnly, deleteUser);
+
 export default router;
